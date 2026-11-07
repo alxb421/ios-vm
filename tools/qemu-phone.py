@@ -93,7 +93,7 @@ def main():
            '-m', f'{ram_gib}G',
            '-object', f'memory-backend-file,id=ram0,size={ram_gib}G,mem-path={shm},share=on',
            '-display', 'none', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
-           '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
+           '-d', 'guest_errors', '-D', f'{out}/qemu.log', '-no-reboot',	# no `-d int`: logging every exception slows TCG a lot
            '-device', 'virtio-keyboard-pci',
            *qs.disk_args(a.disk, out),
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
