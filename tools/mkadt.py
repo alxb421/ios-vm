@@ -151,6 +151,7 @@ def build(seed=None, qemu=False, highmem=False, ncpu=None):
             ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
+            *([('psci-method', cstr('hvc'))] if qemu else []),  # QEMU virt has no EL3: PSCI over HVC (0084)
             ('timebase-frequency', u32(timebase)),
             ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
             ('bus-frequency', u32(100000000)),
