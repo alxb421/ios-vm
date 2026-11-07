@@ -64,6 +64,8 @@ def main():
     ap.add_argument('outdir')
     ap.add_argument('--scale', type=float, default=0, help='window scale of the 343x657 frame (default: fit the screen)')
     ap.add_argument('--cpu', default='cortex-a76')
+    ap.add_argument('--smp', type=int, default=1, help='guest CPUs; needs an ADT from mkadt.py --cpus N and cpus=N in the payload cmdline')
+    ap.add_argument('--disk', help='raw root image, attached as virtio-blk through a qcow2 overlay (boot with rd=vblkroot0)')
     ap.add_argument('--grab', help='render one frame of the window to this PNG and exit (testing)')
     ap.add_argument('--grab-after', type=float, default=30)
     ap.add_argument('--press', help='with --grab: press this button (e.g. "volume up") before grabbing')
@@ -87,12 +89,13 @@ def main():
     if os.path.exists(mon):
         os.unlink(mon)
     shm = f'/dev/shm/ios-vm-ram-{os.getpid()}'
-    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3,memory-backend=ram0', '-cpu', a.cpu, '-smp', '1',
+    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3,memory-backend=ram0', '-cpu', a.cpu, '-smp', str(a.smp),
            '-m', f'{ram_gib}G',
            '-object', f'memory-backend-file,id=ram0,size={ram_gib}G,mem-path={shm},share=on',
            '-display', 'none', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', 'virtio-keyboard-pci',
+           *qs.disk_args(a.disk, out),
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={qs.STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={qs.STUB_PA:#x},cpu-num=0']
