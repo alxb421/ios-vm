@@ -29,6 +29,18 @@ STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
 BOOT_LINE_LENGTH = 608
 
 
+def disk_args(disk, out):
+    """virtio-blk (modern virtio-mmio transport) on a qcow2 overlay: the base image is never written."""
+    if not disk:
+        return []
+    overlay = f'{out}/disk-overlay.qcow2'
+    if not os.path.exists(overlay):
+        subprocess.check_call(['qemu-img', 'create', '-q', '-f', 'qcow2', '-b', os.path.abspath(disk), '-F', 'raw', overlay])
+    return ['-global', 'virtio-mmio.force-legacy=false',
+            '-drive', f'file={overlay},if=none,format=qcow2,id=hd0',
+            '-device', 'virtio-blk-device,drive=hd0']
+
+
 def check_qemu_dependency(cpu='cortex-a76'):
     """Verify qemu-system-aarch64 binary and CPU model support."""
     qemu_bin = shutil.which('qemu-system-aarch64')
@@ -227,6 +239,7 @@ def main():
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
+    ap.add_argument('--disk', help='raw root image, attached as virtio-blk through a qcow2 overlay (boot with rd=vblkroot0)')
     ap.add_argument('--window', action='store_true', help='show the guest framebuffer in a QEMU window (GTK + ramfb) and run until the window is closed')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
@@ -288,6 +301,7 @@ def main():
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
+    cmd += disk_args(a.disk, out)
     if a.gdb:
         cmd += ['-S', '-gdb', 'tcp::1234']
 
