@@ -227,6 +227,7 @@ def main():
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
+    ap.add_argument('--window', action='store_true', help='show the guest framebuffer in a QEMU window (GTK + ramfb) and run until the window is closed')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
 
@@ -264,7 +265,14 @@ def main():
 
     phys_base, img, ba_pa, entry_pa = build_image(payload)
     open(f'{out}/ram.bin', 'wb').write(img)
-    open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
+    if a.window:
+        stub_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'qemu-stub')
+        subprocess.check_call([os.path.join(stub_dir, 'build.sh'), f'{out}/stub.bin'])
+        blob = bytearray(open(f'{out}/stub.bin', 'rb').read())
+        struct.pack_into('<QQ', blob, 8, ba_pa, entry_pa)	# `params` in ramfb-stub.S
+        open(f'{out}/stub.bin', 'wb').write(blob)
+    else:
+        open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
     print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
 
     mon = f'{out}/mon.sock'
@@ -274,7 +282,8 @@ def main():
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
-           '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
+           *(['-display', 'gtk,zoom-to-fit=on', '-device', 'ramfb'] if a.window else ['-nographic']),
+           '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
@@ -292,6 +301,14 @@ def main():
             print('gdb stub on :1234; QMP socket:', mon, file=sys.stderr)
             p.wait()
             return 0
+
+        if a.window:
+            print('window open: close it (or Ctrl-C) to stop; serial -> ' + serial_file, file=sys.stderr)
+            while p.poll() is None:
+                if a.live_serial:
+                    serial_pos = stream_serial_file(serial_file, serial_pos)
+                time.sleep(0.2)
+            return p.returncode or 0
 
         t0 = time.time()
         while p.poll() is None and time.time() - t0 < a.secs:
