@@ -1,0 +1,480 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e25254b..7529614 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_vblk.c			standard
++bsd/dev/sweet_vinput.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_vblk.c b/bsd/dev/sweet_vblk.c
+index 77a3597..6cadd12 100644
+--- a/bsd/dev/sweet_vblk.c
++++ b/bsd/dev/sweet_vblk.c
+@@ -37,6 +37,7 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void sweet_vinput_init(void);    /* bsd/dev/sweet_vinput.c */
+ 
+ /* virtio-mmio, version 2 (modern) register offsets */
+ #define VM_MAGIC        0x000
+@@ -522,6 +523,8 @@ sweet_vblk_init(void)
+ 	devfs_make_node(vb.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "vblkroot0");
+ 	devfs_make_node(makedev(vb.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rvblkroot0");
+ 	vb.ready = true;
++	/* Input devices share the virtio-mmio range: keys and touch for the HID services. */
++	sweet_vinput_init();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_vinput.c b/bsd/dev/sweet_vinput.c
+new file mode 100644
+index 0000000..a46e5b8
+--- /dev/null
++++ b/bsd/dev/sweet_vinput.c
+@@ -0,0 +1,441 @@
++/*
++ * SWEET virtio-input for QEMU's virt board (virtio-mmio, polled).
++ *
++ * Counterpart of the phone's PMIC keys (sweet_keys.c) and Goodix touch
++ * (sweet_touch.c): it feeds the same HID services through sweet_hid_key() and
++ * sweet_hid_touch() (iokit/Kernel/arm/hid/SweetHID.cpp).
++ *
++ *   virtio-keyboard-device  KEY_POWER/KEY_VOLUMEUP/KEY_VOLUMEDOWN/KEY_HOME
++ *                           -> keys 0 (power) / 1 (volume up) / 2 (volume down) / 3 (menu)
++ *   virtio-tablet-device    EV_ABS X/Y (0..32767) + BTN_LEFT -> finger 0, panel pixels
++ *
++ * Every virtio-mmio transport of the ADT node /sweet-vblk is scanned for
++ * DeviceID 18 (input); the device name picks keyboard or tablet. Events arrive
++ * on queue 0 in 8-byte buffers; one kernel thread polls the used rings every
++ * 5 ms. No interrupts are enabled. Boot-arg sweetvinput=0 disables the driver.
++ *
++ * QEMU: -global virtio-mmio.force-legacy=false -device virtio-keyboard-device
++ *       -device virtio-tablet-device
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_vinput_init(void);
++
++#define VM_MAGIC        0x000
++#define VM_VERSION      0x004
++#define VM_DEVICE_ID    0x008
++#define VM_DEV_FEAT     0x010
++#define VM_DEV_FEAT_SEL 0x014
++#define VM_DRV_FEAT     0x020
++#define VM_DRV_FEAT_SEL 0x024
++#define VM_QUEUE_SEL    0x030
++#define VM_QUEUE_MAX    0x034
++#define VM_QUEUE_NUM    0x038
++#define VM_QUEUE_READY  0x044
++#define VM_QUEUE_NOTIFY 0x050
++#define VM_INT_STATUS   0x060
++#define VM_INT_ACK      0x064
++#define VM_STATUS       0x070
++#define VM_DESC_LO      0x080
++#define VM_DESC_HI      0x084
++#define VM_AVAIL_LO     0x090
++#define VM_AVAIL_HI     0x094
++#define VM_USED_LO      0x0a0
++#define VM_USED_HI      0x0a4
++#define VM_CONFIG       0x100
++
++#define VM_MAGIC_VALUE  0x74726976u
++#define VM_SLOT_SIZE    0x200
++#define VM_SLOTS        32
++#define VIRTIO_ID_INPUT 18
++
++#define ST_ACK          1u
++#define ST_DRIVER       2u
++#define ST_DRIVER_OK    4u
++#define ST_FEATURES_OK  8u
++
++#define VQ_DESC_WRITE   2u
++
++/* virtio_input_config: select, subsel, size, reserved[5], union { string[128], ... } */
++#define CFG_ID_NAME     1
++
++#define EV_SYN          0
++#define EV_KEY          1
++#define EV_ABS          3
++#define ABS_X           0
++#define ABS_Y           1
++#define BTN_LEFT        0x110
++#define KEY_VOLUMEDOWN  114
++#define KEY_VOLUMEUP    115
++#define KEY_POWER       116
++#define KEY_HOME        102
++#define ABS_RANGE       32768
++#define PANEL_W         1080
++#define PANEL_H         2400
++
++#define QSZ             16u
++#define MAX_DEVS        4
++#define POLL_MS         5u
++
++struct vq_desc {
++	uint64_t addr;
++	uint32_t len;
++	uint16_t flags;
++	uint16_t next;
++};
++
++struct vq_avail {
++	uint16_t flags;
++	uint16_t idx;
++	uint16_t ring[QSZ];
++};
++
++struct vq_used {
++	uint16_t flags;
++	uint16_t idx;
++	struct {
++		uint32_t id;
++		uint32_t len;
++	} ring[QSZ];
++};
++
++struct vi_event {
++	uint16_t type;
++	uint16_t code;
++	uint32_t value;
++};
++
++/* Per-device DMA block: rings and the event buffers. */
++#define DEV_DESC        0x0000
++#define DEV_AVAIL       0x0400
++#define DEV_USED        0x0800
++#define DEV_EVENTS      0x1000
++#define DEV_STRIDE      0x2000
++
++enum { KIND_KEYBOARD = 1, KIND_TABLET = 2 };
++
++static struct vdev {
++	vm_offset_t regs;
++	int kind;
++	uint8_t *blk;                           /* kernel VA of this device's DMA block */
++	uint64_t blk_pa;
++	uint16_t avail_idx;
++	uint16_t last_used;
++	/* tablet state */
++	int x, y;
++	bool down;
++} devs[MAX_DEVS];
++static unsigned ndevs;
++static bool vi_started;
++static int vi_sleep_chan;
++
++static inline uint32_t
++vm_rd(vm_offset_t regs, uint32_t off)
++{
++	return *(volatile uint32_t *)(regs + off);
++}
++
++static inline void
++vm_wr(vm_offset_t regs, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(regs + off) = v;
++}
++
++static void
++vi_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&vi_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Read the device name through the config space (select ID_NAME, subsel 0). */
++static void
++vi_name(vm_offset_t regs, char *out, size_t cap)
++{
++	volatile uint8_t *cfg = (volatile uint8_t *)(regs + VM_CONFIG);
++	cfg[0] = CFG_ID_NAME;
++	cfg[1] = 0;
++	__builtin_arm_dsb(0xf);
++	size_t n = cfg[2];
++	if (n >= cap) {
++		n = cap - 1;
++	}
++	for (size_t i = 0; i < n; i++) {
++		out[i] = (char)cfg[8 + i];
++	}
++	out[n] = 0;
++}
++
++static bool
++vi_has(const char *s, const char *word)
++{
++	size_t n = strlen(word);
++	for (; *s; s++) {
++		if (strncmp(s, word, n) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++vi_post(struct vdev *d, uint16_t id)
++{
++	struct vq_avail *avail = (struct vq_avail *)(d->blk + DEV_AVAIL);
++	avail->ring[d->avail_idx % QSZ] = id;
++	__builtin_arm_dsb(0xf);
++	d->avail_idx++;
++	avail->idx = d->avail_idx;
++}
++
++static int
++vi_setup(struct vdev *d)
++{
++	vm_offset_t regs = d->regs;
++	struct vq_desc *desc = (struct vq_desc *)(d->blk + DEV_DESC);
++
++	vm_wr(regs, VM_STATUS, 0);
++	vm_wr(regs, VM_STATUS, ST_ACK);
++	vm_wr(regs, VM_STATUS, ST_ACK | ST_DRIVER);
++	vm_wr(regs, VM_DEV_FEAT_SEL, 1);
++	if (!(vm_rd(regs, VM_DEV_FEAT) & 1u)) {
++		printf("SWEET VINPUT: device lacks VIRTIO_F_VERSION_1\n");
++		return ENXIO;
++	}
++	vm_wr(regs, VM_DRV_FEAT_SEL, 0);
++	vm_wr(regs, VM_DRV_FEAT, 0);
++	vm_wr(regs, VM_DRV_FEAT_SEL, 1);
++	vm_wr(regs, VM_DRV_FEAT, 1);
++	vm_wr(regs, VM_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK);
++	if (!(vm_rd(regs, VM_STATUS) & ST_FEATURES_OK)) {
++		return ENXIO;
++	}
++
++	vm_wr(regs, VM_QUEUE_SEL, 0);
++	if (vm_rd(regs, VM_QUEUE_READY) || vm_rd(regs, VM_QUEUE_MAX) < QSZ) {
++		printf("SWEET VINPUT: event queue unavailable (max %u)\n", vm_rd(regs, VM_QUEUE_MAX));
++		return ENXIO;
++	}
++	vm_wr(regs, VM_QUEUE_NUM, QSZ);
++	vm_wr(regs, VM_DESC_LO, (uint32_t)(d->blk_pa + DEV_DESC));
++	vm_wr(regs, VM_DESC_HI, (uint32_t)((d->blk_pa + DEV_DESC) >> 32));
++	vm_wr(regs, VM_AVAIL_LO, (uint32_t)(d->blk_pa + DEV_AVAIL));
++	vm_wr(regs, VM_AVAIL_HI, (uint32_t)((d->blk_pa + DEV_AVAIL) >> 32));
++	vm_wr(regs, VM_USED_LO, (uint32_t)(d->blk_pa + DEV_USED));
++	vm_wr(regs, VM_USED_HI, (uint32_t)((d->blk_pa + DEV_USED) >> 32));
++
++	/* One 8-byte device-writable buffer per descriptor, all handed to the device up front. */
++	for (uint16_t i = 0; i < QSZ; i++) {
++		desc[i].addr = d->blk_pa + DEV_EVENTS + i * sizeof(struct vi_event);
++		desc[i].len = sizeof(struct vi_event);
++		desc[i].flags = VQ_DESC_WRITE;
++		desc[i].next = 0;
++		vi_post(d, i);
++	}
++	__builtin_arm_dsb(0xf);
++	vm_wr(regs, VM_QUEUE_READY, 1);
++	vm_wr(regs, VM_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
++	vm_wr(regs, VM_QUEUE_NOTIFY, 0);
++	return 0;
++}
++
++static void
++vi_keyboard_event(const struct vi_event *e)
++{
++	int key = -1;
++	if (e->type != EV_KEY || e->value > 1) {        /* ignore auto-repeat (2) */
++		return;
++	}
++	switch (e->code) {
++	case KEY_POWER:
++		key = 0;
++		break;
++	case KEY_VOLUMEUP:
++		key = 1;
++		break;
++	case KEY_VOLUMEDOWN:
++		key = 2;
++		break;
++	case KEY_HOME:
++		key = 3;
++		break;
++	}
++	if (key >= 0) {
++		sweet_hid_key(key, (int)e->value);
++	}
++}
++
++static void
++vi_tablet_event(struct vdev *d, const struct vi_event *e)
++{
++	switch (e->type) {
++	case EV_ABS:
++		if (e->code == ABS_X) {
++			d->x = (int)(((uint64_t)e->value * PANEL_W) / ABS_RANGE);
++		} else if (e->code == ABS_Y) {
++			d->y = (int)(((uint64_t)e->value * PANEL_H) / ABS_RANGE);
++		}
++		break;
++	case EV_KEY:
++		if (e->code == BTN_LEFT) {
++			d->down = e->value != 0;
++		}
++		break;
++	case EV_SYN:
++		sweet_hid_touch(0, d->down ? 1 : 0, d->x, d->y);
++		break;
++	}
++}
++
++static void
++vi_poll(struct vdev *d)
++{
++	volatile struct vq_used *used = (volatile struct vq_used *)(d->blk + DEV_USED);
++	struct vi_event *events = (struct vi_event *)(d->blk + DEV_EVENTS);
++	bool posted = false;
++
++	while (used->idx != d->last_used) {
++		__builtin_arm_dsb(0xf);
++		uint32_t id = used->ring[d->last_used % QSZ].id;
++		d->last_used++;
++		if (id < QSZ) {
++			struct vi_event e = events[id];
++			if (d->kind == KIND_KEYBOARD) {
++				vi_keyboard_event(&e);
++			} else {
++				vi_tablet_event(d, &e);
++			}
++			vi_post(d, (uint16_t)id);
++			posted = true;
++		}
++	}
++	if (posted) {
++		vm_wr(d->regs, VM_QUEUE_NOTIFY, 0);
++	}
++	if (vm_rd(d->regs, VM_INT_STATUS)) {
++		vm_wr(d->regs, VM_INT_ACK, vm_rd(d->regs, VM_INT_STATUS));
++	}
++}
++
++static void
++vi_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		for (unsigned i = 0; i < ndevs; i++) {
++			vi_poll(&devs[i]);
++		}
++		vi_wait(POLL_MS);
++	}
++}
++
++static int
++vi_scan(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	vm_offset_t dma;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-vblk", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		return ENXIO;
++	}
++	vm_offset_t io = ml_io_map(reg[0], reg[1]);
++	unsigned slots = (unsigned)MIN(reg[1] / VM_SLOT_SIZE, (uintptr_t)VM_SLOTS);
++
++	if (kmem_alloc_contig(kernel_map, &dma, DEV_STRIDE * MAX_DEVS, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	uint64_t dma_pa = ptoa_64(pn);
++
++	for (unsigned i = 0; i < slots && ndevs < MAX_DEVS; i++) {
++		vm_offset_t regs = io + (vm_offset_t)i * VM_SLOT_SIZE;
++		char name[64];
++		if (vm_rd(regs, VM_MAGIC) != VM_MAGIC_VALUE || vm_rd(regs, VM_DEVICE_ID) != VIRTIO_ID_INPUT ||
++		    vm_rd(regs, VM_VERSION) != 2) {
++			continue;
++		}
++		vi_name(regs, name, sizeof(name));
++		int kind = 0;
++		if (vi_has(name, "Tablet")) {
++			kind = KIND_TABLET;
++		} else if (vi_has(name, "Keyboard")) {
++			kind = KIND_KEYBOARD;
++		}
++		if (!kind) {
++			printf("SWEET VINPUT: slot %u \"%s\" ignored\n", i, name);
++			continue;
++		}
++		struct vdev *d = &devs[ndevs];
++		d->regs = regs;
++		d->kind = kind;
++		d->blk = (uint8_t *)dma + ndevs * DEV_STRIDE;
++		d->blk_pa = dma_pa + ndevs * DEV_STRIDE;
++		if (vi_setup(d) == 0) {
++			printf("SWEET VINPUT: slot %u \"%s\" -> %s\n", i, name,
++			    kind == KIND_TABLET ? "touch" : "keys");
++			ndevs++;
++		}
++	}
++	return ndevs ? 0 : ENODEV;
++}
++
++static void
++vi_start_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	if (vi_scan() == 0) {
++		vi_thread(NULL, 0);
++	} else {
++		printf("SWEET VINPUT: no virtio-input devices\n");
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_vinput_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (vi_started) {
++		return;
++	}
++	vi_started = true;
++	(void)PE_parse_boot_argn("sweetvinput", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET VINPUT: disabled (sweetvinput=0)\n");
++		return;
++	}
++	if (kernel_thread_start(vi_start_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET VINPUT: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

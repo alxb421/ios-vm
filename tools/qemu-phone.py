@@ -32,7 +32,7 @@ BUTTONS = {
     'volume down': (0, 236, 22, 56, 'volumedown'),
     'power':       (321, 209, 22, 82, 'power'),
 }
-KEYS = {'PgUp': 'volumeup', 'PgDown': 'volumedown', 'End': 'power'}
+
 
 
 class Qmp:
@@ -50,6 +50,14 @@ class Qmp:
             r = json.loads(self.f.readline())
             if 'return' in r or 'error' in r:
                 return r
+
+    def touch(self, nx, ny, down):
+        """Absolute pointer (virtio-tablet) at nx, ny in 0..1 over the screen, left button down/up."""
+        ax = lambda axis, v: {'type': 'abs', 'data': {'axis': axis, 'value': int(max(0.0, min(1.0, v)) * 32767)}}
+        evs = [ax('x', nx), ax('y', ny), {'type': 'btn', 'data': {'down': down, 'button': 'left'}}]
+        r = self.call('input-send-event', events=evs)
+        if 'error' in r:
+            print(f'qmp touch: {r["error"]["desc"]}', file=sys.stderr)
 
     def key(self, qcode, down):
         ev = {'type': 'key', 'data': {'down': down, 'key': {'type': 'qcode', 'data': qcode}}}
@@ -94,7 +102,8 @@ def main():
            '-object', f'memory-backend-file,id=ram0,size={ram_gib}G,mem-path={shm},share=on',
            '-display', 'none', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'guest_errors', '-D', f'{out}/qemu.log', '-no-reboot',	# no `-d int`: logging every exception slows TCG a lot
-           '-device', 'virtio-keyboard-pci',
+           '-global', 'virtio-mmio.force-legacy=false',
+           '-device', 'virtio-keyboard-device', '-device', 'virtio-tablet-device',
            *qs.disk_args(a.disk, out),
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={qs.STUB_PA:#x},force-raw=on',
@@ -126,6 +135,7 @@ def main():
                 self.setFixedSize(int(fw * scale), int(fh * scale))
                 self.setFocusPolicy(Qt.StrongFocus)
                 self.down = None
+                self.touching = False
                 t = QTimer(self)
                 t.timeout.connect(self.update)
                 t.start(33)
@@ -148,15 +158,34 @@ def main():
                 self.down = name if down else None
                 qmp.key(BUTTONS[name][4], down)
 
+            def screen_pos(self, e):
+                """Mouse position as 0..1 over the screen area, or None outside it."""
+                sx, sy, sw, sh = SCREEN
+                nx, ny = (e.x() / scale - sx) / sw, (e.y() / scale - sy) / sh
+                return (nx, ny) if 0 <= nx <= 1 and 0 <= ny <= 1 else None
+
             def mousePressEvent(self, e):
                 for name, (x, y, w, h, _q) in BUTTONS.items():
                     if self.r(x, y, w, h).contains(e.pos()):
                         self.press(name, True)
                         return
+                pos = self.screen_pos(e)
+                if pos and e.button() == Qt.LeftButton:
+                    self.touching = True
+                    qmp.touch(*pos, True)
+
+            def mouseMoveEvent(self, e):
+                pos = self.screen_pos(e) if self.touching else None
+                if pos:
+                    qmp.touch(*pos, True)
 
             def mouseReleaseEvent(self, e):
                 if self.down:
                     self.press(self.down, False)
+                if self.touching:
+                    self.touching = False
+                    pos = self.screen_pos(e) or (0.5, 0.5)
+                    qmp.touch(*pos, False)
 
             def keyPressEvent(self, e):
                 for name, (_x, _y, _w, _h, q) in BUTTONS.items():
